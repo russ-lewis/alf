@@ -96,8 +96,9 @@ const fs   = require("fs");
 const util = require("util");
 const exec = util.promisify(require("child_process").exec);
 
-// my library
-const git = require("./git");
+// my libraries
+const git    = require("./git");
+const docker = require("./docker");
 
 
 
@@ -117,11 +118,13 @@ const git = require("./git");
 
 const PROJECT_CONFIGS = [ { "clone_url"      : "https://github.com/russ-lewis/alf_dummy_client",
                             "container_range": [2,5],
-                            "dockerfile"     : "Dockerfile.dummy1" },
+                            "dockerfile"     : "Dockerfile.dummy1",
+                            "hook_dir"       : "/alf_hooks/" },
 
                           { "clone_url"      : "https://github.com/russ-lewis/alf_dummy_client",
                             "container_range": [2,5],
-                            "dockerfile"     : "Dockerfile.dummy2" }
+                            "dockerfile"     : "Dockerfile.dummy2",
+                            "hook_dir"       : "/alf_hooks/" }
                         ];
 
 var repo_map = {};   // filled during init, baed on the CONFIGS above
@@ -146,7 +149,11 @@ async function init()
         if ( !(url in repo_map) )
         {
             const tmpdir = `/tmp/alf_repo_${i}`;
-            repo_map[url] = { "tmpdir": tmpdir, "sha": null, "update_pending": false, "lock_count": 0 };
+            repo_map[url] = { "tmpdir"        : tmpdir,
+                              "sha"           : null,
+                              "update_pending": false,
+                              "lock_count": 0
+                            };
 
             // the async process is not process specific at this stage; we
             // first have to clone the repo into the temporary directory.
@@ -157,7 +164,10 @@ async function init()
 
         project_states.push( { "state"         : "init",
                                "container_name": `alf_local_container_${i}`,
-                               "containers"    : { "active": [], "starting": [], "ending": [] },
+                               "hooks"         : null,
+                               "containers"    : { "active"  : new Set(),
+                                                   "starting": new Set(),
+                                                   "ending"  : new Set() },
                                "update_pending": false,
                                "config"        : proj,
                                "repo"          : repo_map[url]
@@ -169,7 +179,7 @@ async function init()
     console.log("init(): All initialization is complete.");
 
     console.log("----");
-    console.log(project_states);
+    console.dir(project_states, {depth:null});
 };
 
 
@@ -193,9 +203,15 @@ async function init_one_repo(url)
 //    await exec(`git clone ${url} ${tmpdir}`);
     console.log("TODO: If I accept old directories, then I need to do a 'git pull'");
 
-    var sha = await git.get_sha(tmpdir);
+    const sha = await git.get_sha(tmpdir);
     console.log(`init_one_repo(${url}): sha=${sha}`);
     repo.sha = sha;
+
+    // now that we have got a working Git directory and its SHA hash, we can
+    // mark the repo state as "normal."  However, we have to make sure that
+    // the ordinary contaienr-upgrade does *NOT* run; we instead need to
+    // create a bunch of containers all at once.
+    repo.state = "normal";
 
     var wait_on = [];
     for (var i=0; i<project_states.length; i++)
@@ -219,11 +235,14 @@ async function init_one_proj(proj)
     const cont_name  = proj.container_name;
     const min_conts  = proj.config.container_range[0];
 
+    if (proj.state != "init")
+        throw "init_one_proj(): State of the project must be 'init'";
+
     await rebuild_container_image(proj);
 
     var wait_on = [];
     for (var i=0; i<min_conts; i++)
-        wait_on.push(create_container(cont_name));
+        wait_on.push(start_one_container(proj));
     await Promise.all(wait_on);
 
     set_proj_ready(proj);
@@ -236,21 +255,46 @@ async function rebuild_container_image(proj)
     inc_repo_lock_count(proj.repo);
     console.log("TODO: rebuild the container from the Dockerfile");
     dec_repo_lock_count(proj.repo);
+
+    // get the list of hooks from the container.  This command is a lot more
+    // complex than I would like; I'd love to find something simpler.  First of
+    // all, I don't know of any way to read the contents of an image without
+    // starting up a container and running "ls", although that seems crazy to
+    // me.  But if we assume that that's the case, then we can do a synchronous
+    // 'run' operation to do it; this creates a container, runs a trivial
+    // command, and then immediately stops and cleans up the container.  So
+    // wasteful!
+    //
+    // Anyways, we want to get a list of commands that are in the hook
+    // directory; if the diectory exists but is empty, then this will return
+    // an empty string.  But if it *doesn't* exist, then we will get both
+    // output to stderr, and also a nonzero exit code.  That's why we wrap it
+    // all in a 'bash -c' command; that allows us to discard stderr, and also
+    // to force a zero return code.  (sigh)  Why is this so complex, to do
+    // something so simple???
+    const cont_name   = proj.container_name;
+    const hook_dir    = proj.config.hook_dir;
+    const hook_stdout = await docker.run(cont_name, `bash -c "ls -1 ${hook_dir} 2>/dev/null; exit 0"`);
+
+    if (hook_stdout == "")
+        proj.hooks = [];
+    else
+        proj.hooks = hook_stdout.split('\n');
 };
 
 
 
 async function inc_repo_lock_count(repo)
 {
-    if (proj.repo.state != "normal")
+    if (repo.state != "normal")
         throw "inc_repo_lock_count() can only be called when the repo is in the 'normal' state";
     repo.lock_count += 1;
 }
 async function dec_repo_lock_count(repo)
 {
-    if (proj.repo.state != "normal")
+    if (repo.state != "normal")
         throw "dec_repo_lock_count() can only be called when the repo is in the 'normal' state";
-    if (proj.repo.lock_count <= 0)
+    if (repo.lock_count <= 0)
         throw "dec_repo_lock_count() can only be called when the lock_count is positive";
 
     repo.lock_count -= 1;
@@ -261,9 +305,18 @@ async function dec_repo_lock_count(repo)
 
 
 
-async function create_container(container_name)
+async function start_one_container(proj)
 {
-    TODO
+    const cont_id = await docker.create_container(proj.container_name);
+    proj.containers.starting.add(cont_id);
+
+    // the 'wait_ready' hook, if defined, is used for the user to hold us up
+    // until we report that the container is initialized and ready for use.
+    if ("wait_ready" in proj.hooks)
+        await docker.exec(cont_id, "/alf_hooks/wait_ready");
+
+    proj.containers.starting.delete(cont_id);
+    proj.containers.active  .add   (cont_id);
 };
 
 
